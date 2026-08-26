@@ -20,7 +20,6 @@ shopt -s nullglob
 
 RUN_NAME="dataset"
 WARP_TS="/path/to/warp_tiltseries_dataset"
-TOMOSTAR_DIR="/path/to/tomostar_dataset"
 MASK_SOURCE_DIR="/path/to/masks"    # expected: <prefix>.mrc or <prefix>_Vol_bmask.mrc
 
 AC=0.07
@@ -52,12 +51,10 @@ abs_path() {
 }
 
 WARP_TS="$(abs_path "$WARP_TS")"
-TOMOSTAR_DIR="$(abs_path "$TOMOSTAR_DIR")"
 MASK_SOURCE_DIR="$(abs_path "$MASK_SOURCE_DIR")"
 WORK_ROOT="$(abs_path "$WORK_ROOT")"
 
 RECON="$WARP_TS/reconstruction_miss"
-TILTSTACK="$WARP_TS/tiltstack"
 RUN_ID="${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="$WORK_ROOT/${RUN_NAME}_${OUTPUT_NAME}_${RUN_ID}"
 
@@ -73,35 +70,6 @@ cd "$RUN_DIR"
 ml purge
 ml "$ISONET_MODULE"
 GPU_IDS="${CUDA_VISIBLE_DEVICES:-0}"
-
-find_tlt_file() {
-    local prefix="$1"
-    local candidates=(
-        "$TILTSTACK/$prefix/${prefix}_Imod/${prefix}_st.tlt"
-        "$TOMOSTAR_DIR/${prefix}.tlt"
-    )
-    local candidate
-
-    for candidate in "${candidates[@]}"; do
-        if [[ -f "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-
-    mapfile -t candidates < <(
-        find "$TILTSTACK" -type f \
-            \( -name "${prefix}_st.tlt" -o -name "${prefix}.tlt" \) \
-            2>/dev/null | sort
-    )
-
-    if ((${#candidates[@]} == 1)); then
-        printf '%s\n' "${candidates[0]}"
-        return 0
-    fi
-
-    return 1
-}
 
 find_mask_file() {
     local prefix="$1"
@@ -127,9 +95,10 @@ mapfile -t ODD_FILES < <(
 
 ((${#ODD_FILES[@]} > 0)) || die "No odd half maps matching *Apx.mrc in $RECON/odd"
 
-TLT_FILES=()
 DEFOCUS_A_LIST=()
 PREFIXES=()
+TILT_MIN_LIST=()
+TILT_MAX_LIST=()
 
 for odd_source in "${ODD_FILES[@]}"; do
     base="$(basename "$odd_source" .mrc)"
@@ -148,7 +117,6 @@ for odd_source in "${ODD_FILES[@]}"; do
     }
 
     even_source="${even_matches[0]}"
-    tlt_file="$(find_tlt_file "$prefix")" || die "Could not locate a unique TLT file for $prefix"
     mask_source="$(find_mask_file "$prefix")" || die "Could not locate mask for $prefix"
     xml_file="$WARP_TS/${prefix}.xml"
 
@@ -169,25 +137,54 @@ for odd_source in "${ODD_FILES[@]}"; do
         awk -v defocus="$defocus_um" 'BEGIN {printf "%.2f", defocus * 10000.0}'
     )"
 
-    TLT_FILES+=("$tlt_file")
+    read -r tomo_tilt_min tomo_tilt_max < <(
+        python - "$xml_file" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+
+angles = []
+for node in root.findall(".//Angles"):
+    angles.extend(float(value) for value in (node.text or "").split())
+
+use_tilt = []
+for node in root.findall(".//UseTilt"):
+    use_tilt.extend(
+        value.lower() in {"true", "1"}
+        for value in (node.text or "").split()
+    )
+
+if use_tilt:
+    if len(use_tilt) != len(angles):
+        raise SystemExit(
+            f"UseTilt/Angles length mismatch in {sys.argv[1]}: "
+            f"{len(use_tilt)} versus {len(angles)}"
+        )
+    angles = [angle for angle, use in zip(angles, use_tilt) if use]
+
+if not angles:
+    raise SystemExit(f"No enabled tilt angles found in {sys.argv[1]}")
+
+# Warp stores tilt angles in the opposite convention from IMOD/PyTom.
+angles = [-angle for angle in angles]
+print(f"{min(angles):.2f} {max(angles):.2f}")
+PY
+    )
+
     DEFOCUS_A_LIST+=("$defocus_angstrom")
     PREFIXES+=("$prefix")
+    TILT_MIN_LIST+=("$tomo_tilt_min")
+    TILT_MAX_LIST+=("$tomo_tilt_max")
 done
 
-tilt_min="$(
-    awk 'NR == 1 || $1 < minimum {minimum = $1}
-         END {printf "%.2f", minimum}' "${TLT_FILES[@]}"
-)"
-tilt_max="$(
-    awk 'NR == 1 || $1 > maximum {maximum = $1}
-         END {printf "%.2f", maximum}' "${TLT_FILES[@]}"
-)"
 defocus_csv="$(IFS=,; echo "${DEFOCUS_A_LIST[*]}")"
 
 echo "IsoNet2 prefixes:"
-printf '  %s\n' "${PREFIXES[@]}"
-echo "tilt_min:  $tilt_min"
-echo "tilt_max:  $tilt_max"
+for i in "${!PREFIXES[@]}"; do
+    printf '  %s: tilt_min=%s tilt_max=%s\n' \
+        "${PREFIXES[$i]}" "${TILT_MIN_LIST[$i]}" "${TILT_MAX_LIST[$i]}"
+done
 echo "defocus_A: [$defocus_csv]"
 echo "AC:        $AC"
 echo "cube_size: $CUBE_SIZE"
@@ -201,12 +198,57 @@ isonet.py prepare_star \
     --even even/ \
     --odd odd/ \
     --mask_folder mask/ \
-    --tilt_min "$tilt_min" \
-    --tilt_max "$tilt_max" \
+    --tilt_min "${TILT_MIN_LIST[0]}" \
+    --tilt_max "${TILT_MAX_LIST[0]}" \
     --defocus "[$defocus_csv]" \
     --ac "$AC" \
     --voltage "$VOLTAGE" \
     --star_name "$STAR_FILE"
+
+TILT_RANGE_FILE="tilt_ranges.tsv"
+for i in "${!PREFIXES[@]}"; do
+    printf '%s\t%s\t%s\n' \
+        "${PREFIXES[$i]}" "${TILT_MIN_LIST[$i]}" "${TILT_MAX_LIST[$i]}"
+done > "$TILT_RANGE_FILE"
+
+python - "$STAR_FILE" "$TILT_RANGE_FILE" <<'PY'
+import sys
+from pathlib import Path
+
+import starfile
+
+star_path = sys.argv[1]
+ranges = {}
+
+with open(sys.argv[2], encoding="utf-8") as handle:
+    for line in handle:
+        prefix, tilt_min, tilt_max = line.rstrip("\n").split("\t")
+        ranges[prefix] = (float(tilt_min), float(tilt_max))
+
+table = starfile.read(star_path)
+
+for index, row in table.iterrows():
+    name = Path(
+        str(row["rlnTomoReconstructedTomogramHalf1"])
+    ).name
+
+    suffix = "_EVN_Vol.mrc"
+
+    if not name.endswith(suffix):
+        raise SystemExit(
+            f"Unexpected even-half filename in {star_path}: {name}"
+        )
+
+    prefix = name[:-len(suffix)]
+
+    if prefix not in ranges:
+        raise SystemExit(f"No XML tilt range found for {prefix}")
+
+    table.at[index, "rlnTiltMin"] = ranges[prefix][0]
+    table.at[index, "rlnTiltMax"] = ranges[prefix][1]
+
+starfile.write(table, star_path)
+PY
 
 time isonet.py refine \
     "$STAR_FILE" \
