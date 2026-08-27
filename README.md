@@ -49,23 +49,23 @@ It runs on all tilt-series matched by `--pattern` (default `Position*.xml`) unle
 
 ```bash
 ./warp2pytom.py \
-  -i /path/to/warp/tiltseries \              # required: dir with Position_*.xml and reconstruction/
-  -d submission \                             # optional: output dir name (gets created), default "submission"
-  -t /path/to/template.mrc \                  # required
-  -m /path/to/mask.mrc \                      # required
-  -g 0 \                                      # required, GPU IDs space-separated (no commas)
-  --voxel-size-angstrom 10 \                  # required
-  --dose 2 \                                  # optional fallback if XML has no <Dose> (e-/Å² per tilt)
-  --mode array \                               # array (default) or per-tomo
-  [--include Position_*] [--exclude Position_5] \   # optional wildcard filtering
-  [--angular-search 10 | --particle-diameter 140] \ # one of these is required
-  -s 2 2 1 \                                  # optional
-  --per-tilt-weighting \                      # optional but highly recommended
-  --non-spherical-mask \                      # optional
-  --tomogram-ctf-model phase-flip \           # optional but recommended
-  -r \                                         # optional but recommended
-  --rng-seed 69 \                              # default: 69
-  [--dry-run]                                  # optional
+  -i /path/to/warp/tiltseries \                      # required: dir with Position_*.xml and reconstruction/
+  -d submission \                                    # optional: output dir name (gets created), default "submission"
+  -t /path/to/template.mrc \                         # required
+  -m /path/to/mask.mrc \                             # required
+  -g 0 \                                             # required, GPU IDs space-separated (no commas)
+  --voxel-size-angstrom 10 \                         # required
+  --dose 2 \                                         # optional fallback if XML has no <Dose> (e-/Å² per tilt)
+  --mode array \                                     # array (default) or per-tomo
+  [--include Position_*] [--exclude Position_5] \    # optional wildcard filtering
+  --angular-search 10  \                             # angular search, the lower the finer and slower is the search. Optional also --particle-diameter
+  -s 2 2 1 \                                         # optional
+  --per-tilt-weighting \                             # optional but highly recommended
+  --non-spherical-mask \                             # optional
+  --tomogram-ctf-model phase-flip \                  # optional but recommended
+  -r \                                               # optional but recommended
+  --rng-seed 69 \                                    # default: 69
+  [--dry-run]                                        # optional
 ```
 
 > **Note:** one of `--particle-diameter` or `--angular-search` is **required** (mutually exclusive).
