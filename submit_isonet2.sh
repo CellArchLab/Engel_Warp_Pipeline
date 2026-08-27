@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --exclude=sgp[01-04]
 #SBATCH --mem=100G
-#SBATCH --time=00-06:00:00
+#SBATCH --time=00-08:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH -o isonet2_%j.out
 #SBATCH -e isonet2_%j.err
