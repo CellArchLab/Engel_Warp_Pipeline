@@ -104,19 +104,9 @@ for odd_source in "${ODD_FILES[@]}"; do
     base="$(basename "$odd_source" .mrc)"
     prefix="${base%_*Apx}"
 
-    mapfile -t even_matches < <(
-        find "$RECON/even" -maxdepth 1 -type f \
-            -name "${prefix}_*Apx.mrc" | sort
-    )
+    even_source="$RECON/even/$(basename "$odd_source")"
+    [[ -f "$even_source" ]] || die "Even half map not found: $even_source"
 
-    ((${#even_matches[@]} == 1)) || {
-        printf 'ERROR: expected one even half map for %s; found %d\n' \
-            "$prefix" "${#even_matches[@]}" >&2
-        printf '  %s\n' "${even_matches[@]}" >&2
-        exit 1
-    }
-
-    even_source="${even_matches[0]}"
     mask_source="$(find_mask_file "$prefix")" || die "Could not locate mask for $prefix"
     xml_file="$WARP_TS/${prefix}.xml"
 
