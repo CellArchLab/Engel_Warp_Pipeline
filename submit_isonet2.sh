@@ -2,11 +2,11 @@
 #SBATCH -J isonet2
 #SBATCH --partition=emgpu
 #SBATCH --qos=emgpu
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --exclude=sgp[01-04]
-#SBATCH --mem=128G
+#SBATCH --mem=100G
 #SBATCH --time=00-06:00:00
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH -o isonet2_%j.out
 #SBATCH -e isonet2_%j.err
 #SBATCH -D ./
