@@ -27,6 +27,7 @@ sbatch submit_warp-missalignment.sh
 
 ## 2. Batch Submission of `pytom-match-pick` from Warp/M
 
+Check `--help` for all flag options and description especially for the SLURM header.
 This script automates batch submission of `pytom-match-pick` jobs on an HPC cluster (SLURM) by reading metadata directly from Warp tilt-series XMLs. It:
 
 - Extracts **tilt angles** from `<Angles>` in each `Position_*.xml` (sign-flipped to the pytom convention)
