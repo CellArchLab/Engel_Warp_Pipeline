@@ -16,7 +16,7 @@ def parse_args():
     )
     p.add_argument("-i", "--warp-dir", required=True, help="Warp tilt-series directory containing Position_*.xml and reconstruction/")
     p.add_argument("-d", "--output-dir", default="submission", help="Output directory")
-    p.add_argument("--pattern", default="Position*.xml", help="XML glob pattern inside --warp-dir")
+    p.add_argument("--pattern", default="*.xml", help="XML glob pattern inside --warp-dir")
     p.add_argument("--bmask-dir", help="Optional tomogram-mask directory with files named <prefix>.mrc")
     p.add_argument("--mode", choices=["array", "per-tomo"], default="array")
 
