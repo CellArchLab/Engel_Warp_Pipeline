@@ -65,7 +65,7 @@ def parse_args():
     p.add_argument("--qos", default="emgpu")
     p.add_argument("--time", default="05:00:00")
     p.add_argument("--mail-type", default="none")
-    p.add_argument("--array-max-parallel", type=int)
+    p.add_argument("--array-max-parallel", type=int, default=8)
     p.add_argument("--exclude-nodes", nargs="+")
     p.add_argument("--include-nodes", nargs="+")
     return p.parse_args()
