@@ -16,21 +16,18 @@
 
 set -eo pipefail
 shopt -s nullglob
-
 # =============================================================================
 # USER SETTINGS
 # =============================================================================
-
 RUN_NAME="dataset"
 DATA_FOLDER="/path/to/raw_frames_and_mdocs"
 EXTENSION="tiff"                    # eer | tiff | tif | mrc
 ANGPIX="1.912"                      # unbinned acquisition pixel size (A/px)
 PRE_BIN="1"                         # frame-series pre-binning during import
-GAIN_PATH="/path/to/gain_reference.mrc"
+GAIN_PATH=""                        # optional; leave empty for no gain correction
 EXPOSURE="2.22"                     # dose per tilt (e-/A^2)
 TILT_AXIS="-84.25"                  # leave empty to use the mdoc value
 EER_NGROUPS="16"
-
 GAIN_FLIP_Y="false"
 AT_BINNING="8"                      # QC/alignment reconstruction binning
 MA_BINNING="4"                      # post-MissAlignment reconstruction binning
@@ -48,7 +45,6 @@ TILT_OFFSET="-10"
 AUTOLEVEL_PATCH_SIZE="1500"
 PERDEVICE="1"
 DEFOCUS_HAND="set_auto"             # check | set_auto | set_flip | set_noflip
-
 M_GRID="1x1x3"
 C_GRID="2x2x1"
 C_RANGE_MAX="5"
@@ -69,13 +65,11 @@ MISS_RECON_DEV="2,2,2,3,3,3"
 MISS_DATALOADERS="5"
 MISS_PREPARE_STACKS="10.0"
 MISS_NCCL_P2P_DISABLE="false"
-
 WARP_MODULE="WarpM"
 IMOD_MODULE="IMOD"
 ARETOMO2_MODULE="AreTomo2"
 ARETOMO3_MODULE="AreTomo3"
 MISS_MODULE="MissAlignment"
-
 # =============================================================================
 # END USER SETTINGS
 # =============================================================================
@@ -95,7 +89,6 @@ backup_if_exists() {
 }
 
 [[ -d "$DATA_FOLDER" ]] || die "DATA_FOLDER not found: $DATA_FOLDER"
-[[ -f "$GAIN_PATH" ]] || die "GAIN_PATH not found: $GAIN_PATH"
 [[ "$PRE_BIN" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "PRE_BIN must be numeric"
 
 if [[ "$USE_ARETOMO3" == "true" ]]; then
@@ -110,19 +103,29 @@ ml "$IMOD_MODULE"
 ml "$ARETOMO_MODULE"
 export no_proxy=localhost,127.0.0.1
 
-# Warp requires an MRC gain reference.
-case "${GAIN_PATH,,}" in
-    *.mrc)
-        ;;
-    *)
-        GAIN_MRC="${GAIN_PATH%.*}.mrc"
-        if [[ ! -f "$GAIN_MRC" ]]; then
-            echo "Converting gain to MRC: $GAIN_PATH -> $GAIN_MRC"
-            tif2mrc "$GAIN_PATH" "$GAIN_MRC"
-        fi
-        GAIN_PATH="$GAIN_MRC"
-        ;;
-esac
+GAIN_ARGS=()
+
+if [[ -n "$GAIN_PATH" ]]; then
+    [[ -f "$GAIN_PATH" ]] || die "GAIN_PATH not found: $GAIN_PATH"
+
+    case "${GAIN_PATH,,}" in
+        *.mrc)
+            ;;
+        *)
+            GAIN_MRC="${GAIN_PATH%.*}.mrc"
+            if [[ ! -f "$GAIN_MRC" ]]; then
+                echo "Converting gain to MRC: $GAIN_PATH -> $GAIN_MRC"
+                tif2mrc "$GAIN_PATH" "$GAIN_MRC"
+            fi
+            GAIN_PATH="$GAIN_MRC"
+            ;;
+    esac
+
+    GAIN_ARGS+=(--gain_path "$GAIN_PATH")
+    [[ "$GAIN_FLIP_Y" == "true" ]] && GAIN_ARGS+=(--gain_flip_y)
+else
+    echo "No gain reference supplied; Warp will process without gain correction."
+fi
 
 FS_DIR="warp_frameseries_${RUN_NAME}"
 TS_DIR="warp_tiltseries_${RUN_NAME}"
@@ -138,9 +141,6 @@ _rest="${TOMO_DIMENSIONS#*x}"
 TOMO_Y="${_rest%%x*}"
 TOMO_Z="${_rest#*x}"
 
-GAIN_ARGS=()
-[[ "$GAIN_FLIP_Y" == "true" ]] && GAIN_ARGS+=(--gain_flip_y)
-
 EER_ARGS=()
 [[ "${EXTENSION,,}" == "eer" ]] && EER_ARGS+=(--eer_ngroups "$EER_NGROUPS")
 
@@ -152,7 +152,6 @@ else
     ARETOMO_AXIS_ARGS=()
     echo "WARNING: TILT_AXIS is empty; Warp will use the mdoc value."
 fi
-
 if [[ "$AUTOZERO" == "true" ]]; then
     IMPORT_GEOMETRY_ARGS+=(--auto_zero)
 elif [[ -n "$TILT_OFFSET" ]]; then
@@ -182,7 +181,6 @@ WarpTools create_settings \
     --extension "*.${EXTENSION}" \
     --angpix "$ANGPIX" \
     --bin "$PRE_BIN" \
-    --gain_path "$GAIN_PATH" \
     "${GAIN_ARGS[@]}" \
     "${EER_ARGS[@]}" \
     --exposure "$EXPOSURE"
@@ -219,7 +217,6 @@ WarpTools create_settings \
     --folder_data "$TOMOSTAR_DIR" \
     --extension "*.tomostar" \
     --angpix "$ANGPIX" \
-    --gain_path "$GAIN_PATH" \
     "${GAIN_ARGS[@]}" \
     --exposure "$EXPOSURE" \
     "${EER_ARGS[@]}" \
@@ -393,8 +390,10 @@ cat > "$TS_DIR/submit_missalignment.sh" <<MISS
 #SBATCH --qos=emgpu
 
 set -Eeuo pipefail
+
 ml purge
 ml "${MISS_MODULE}"
+
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 ${NCCL_LINE}
@@ -410,6 +409,7 @@ miss-alignment train \
     --start-at-iteration 0 \
     --prepare-stacks "${MISS_PREPARE_STACKS}"
 MISS
+
 chmod +x "$TS_DIR/submit_missalignment.sh"
 
 # 9. Post-MissAlignment CTF and reconstruction
@@ -474,6 +474,7 @@ ln -sfn "reconstruction_miss" "${TS_DIR}/reconstruction"
 echo "Post-MissAlignment output: ${TS_DIR}/reconstruction_miss"
 echo "Compatibility symlink:    ${TS_DIR}/reconstruction -> reconstruction_miss"
 POST
+
 chmod +x "submit_post_miss_${RUN_NAME}.sh"
 
 # 10. Submit dependency chain
@@ -484,7 +485,9 @@ MISS_JID=$(
 echo "Submitted Miss-Alignment job: $MISS_JID"
 
 POST_JID=$(
-    sbatch --parsable         --dependency="afterok:${MISS_JID}"         "submit_post_miss_${RUN_NAME}.sh"
+    sbatch --parsable \
+        --dependency="afterok:${MISS_JID}" \
+        "submit_post_miss_${RUN_NAME}.sh"
 )
 echo "Submitted post-MissAlignment reconstruction: $POST_JID"
 
