@@ -18,9 +18,8 @@ shopt -s nullglob
 # USER SETTINGS
 # =============================================================================
 
-RUN_NAME="dataset"
-WARP_TS="/path/to/warp_tiltseries_dataset"
-MASK_SOURCE_DIR="/path/to/masks"    # expected: <prefix>.mrc or <prefix>_Vol_bmask.mrc
+WARP_TS="/path/to/warp_tiltseries_dataset"    # warp_tiltseries_* folder
+MASK_SOURCE_DIR="/path/to/masks"              # per-tomo masks as <prefix>.mrc or one single mask as *mask.mrc
 
 AC=0.07
 CUBE_SIZE=96
@@ -56,7 +55,7 @@ WORK_ROOT="$(abs_path "$WORK_ROOT")"
 
 RECON="$WARP_TS/reconstruction_miss"
 RUN_ID="${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}"
-RUN_DIR="$WORK_ROOT/${RUN_NAME}_${OUTPUT_NAME}_${RUN_ID}"
+RUN_DIR="$WORK_ROOT/${OUTPUT_NAME}_${RUN_ID}"
 
 [[ -d "$WARP_TS" ]] || die "Warp tilt-series directory not found: $WARP_TS"
 [[ -d "$RECON/odd" ]] || die "Odd half-map directory not found: $RECON/odd"
@@ -71,24 +70,6 @@ ml purge
 ml "$ISONET_MODULE"
 GPU_IDS="${CUDA_VISIBLE_DEVICES:-0}"
 
-find_mask_file() {
-    local prefix="$1"
-    local candidates=(
-        "$MASK_SOURCE_DIR/${prefix}.mrc"
-        "$MASK_SOURCE_DIR/${prefix}_Vol_bmask.mrc"
-    )
-    local candidate
-
-    for candidate in "${candidates[@]}"; do
-        if [[ -f "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-
-    return 1
-}
-
 mapfile -t ODD_FILES < <(
     find "$RECON/odd" -maxdepth 1 -type f -name "*Apx.mrc" | sort
 )
@@ -99,6 +80,8 @@ DEFOCUS_A_LIST=()
 PREFIXES=()
 TILT_MIN_LIST=()
 TILT_MAX_LIST=()
+ODD_SOURCE_LIST=()
+EVEN_SOURCE_LIST=()
 
 for odd_source in "${ODD_FILES[@]}"; do
     base="$(basename "$odd_source" .mrc)"
@@ -107,14 +90,8 @@ for odd_source in "${ODD_FILES[@]}"; do
     even_source="$RECON/even/$(basename "$odd_source")"
     [[ -f "$even_source" ]] || die "Even half map not found: $even_source"
 
-    mask_source="$(find_mask_file "$prefix")" || die "Could not locate mask for $prefix"
     xml_file="$WARP_TS/${prefix}.xml"
-
     [[ -f "$xml_file" ]] || die "Warp XML not found: $xml_file"
-
-    ln -s "$(realpath "$odd_source")" "odd/${prefix}_ODD_Vol.mrc"
-    ln -s "$(realpath "$even_source")" "even/${prefix}_EVN_Vol.mrc"
-    ln -s "$(realpath "$mask_source")" "mask/${prefix}_Vol_bmask.mrc"
 
     defocus_um="$(
         sed -n 's/.*Name="Defocus" Value="\([^"]*\)".*/\1/p' "$xml_file" |
@@ -156,16 +133,135 @@ if use_tilt:
 if not angles:
     raise SystemExit(f"No enabled tilt angles found in {sys.argv[1]}")
 
-# Warp stores tilt angles in the opposite convention from IMOD/PyTom.
 angles = [-angle for angle in angles]
 print(f"{min(angles):.2f} {max(angles):.2f}")
 PY
     )
 
-    DEFOCUS_A_LIST+=("$defocus_angstrom")
     PREFIXES+=("$prefix")
+    ODD_SOURCE_LIST+=("$odd_source")
+    EVEN_SOURCE_LIST+=("$even_source")
+    DEFOCUS_A_LIST+=("$defocus_angstrom")
     TILT_MIN_LIST+=("$tomo_tilt_min")
     TILT_MAX_LIST+=("$tomo_tilt_max")
+done
+
+find_specific_mask() {
+    local prefix="$1"
+    local candidates=(
+        "$MASK_SOURCE_DIR/${prefix}.mrc"
+        "$MASK_SOURCE_DIR/${prefix}_Vol_bmask.mrc"
+        "$MASK_SOURCE_DIR/${prefix}_bmask.mrc"
+        "$MASK_SOURCE_DIR/${prefix}_mask.mrc"
+    )
+    local candidate
+
+    for candidate in "${candidates[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+declare -A SPECIFIC_MASKS
+ALL_SPECIFIC="true"
+
+for prefix in "${PREFIXES[@]}"; do
+    if mask_source="$(find_specific_mask "$prefix")"; then
+        SPECIFIC_MASKS["$prefix"]="$mask_source"
+    else
+        ALL_SPECIFIC="false"
+    fi
+done
+
+MASK_MODE=""
+SHARED_MASK=""
+
+if [[ "$ALL_SPECIFIC" == "true" ]]; then
+    MASK_MODE="per-tomogram"
+else
+    MASK_MODE="shared"
+
+    mapfile -t ALL_MRCS < <(
+        find "$MASK_SOURCE_DIR" -maxdepth 1 -type f -iname "*.mrc" | sort
+    )
+
+    if ((${#ALL_MRCS[@]} == 1)); then
+        SHARED_MASK="${ALL_MRCS[0]}"
+    else
+        SHARED_CANDIDATES=()
+
+        [[ -f "$MASK_SOURCE_DIR/mask.mrc" ]] &&
+            SHARED_CANDIDATES+=("$MASK_SOURCE_DIR/mask.mrc")
+
+        [[ -f "$MASK_SOURCE_DIR/bmask.mrc" ]] &&
+            SHARED_CANDIDATES+=("$MASK_SOURCE_DIR/bmask.mrc")
+
+        if ((${#SHARED_CANDIDATES[@]} == 0)); then
+            mapfile -t MASK_GLOB < <(
+                find "$MASK_SOURCE_DIR" \
+                    -maxdepth 1 \
+                    -type f \
+                    -iname "*mask.mrc" |
+                sort
+            )
+
+            for candidate in "${MASK_GLOB[@]}"; do
+                is_specific="false"
+
+                for prefix in "${PREFIXES[@]}"; do
+                    if [[ "${SPECIFIC_MASKS[$prefix]:-}" == "$candidate" ]]; then
+                        is_specific="true"
+                        break
+                    fi
+                done
+
+                [[ "$is_specific" == "false" ]] &&
+                    SHARED_CANDIDATES+=("$candidate")
+            done
+        fi
+
+        case "${#SHARED_CANDIDATES[@]}" in
+            0)
+                echo "Tomograms without specific masks:" >&2
+                for prefix in "${PREFIXES[@]}"; do
+                    [[ -z "${SPECIFIC_MASKS[$prefix]:-}" ]] &&
+                        echo "  $prefix" >&2
+                done
+                die "Not every tomogram has a mask and no unique shared mask was found"
+                ;;
+            1)
+                SHARED_MASK="${SHARED_CANDIDATES[0]}"
+                ;;
+            *)
+                echo "Multiple possible shared masks found:" >&2
+                printf '  %s\n' "${SHARED_CANDIDATES[@]}" >&2
+                die "Could not uniquely determine shared mask"
+                ;;
+        esac
+    fi
+fi
+
+echo "Mask mode: $MASK_MODE"
+[[ "$MASK_MODE" == "shared" ]] && echo "Shared mask: $SHARED_MASK"
+
+for i in "${!PREFIXES[@]}"; do
+    prefix="${PREFIXES[$i]}"
+    odd_source="${ODD_SOURCE_LIST[$i]}"
+    even_source="${EVEN_SOURCE_LIST[$i]}"
+
+    if [[ "$MASK_MODE" == "per-tomogram" ]]; then
+        mask_source="${SPECIFIC_MASKS[$prefix]}"
+    else
+        mask_source="$SHARED_MASK"
+    fi
+
+    ln -s "$(realpath "$odd_source")" "odd/${prefix}_ODD_Vol.mrc"
+    ln -s "$(realpath "$even_source")" "even/${prefix}_EVN_Vol.mrc"
+    ln -s "$(realpath "$mask_source")" "mask/${prefix}_Vol_bmask.mrc"
 done
 
 defocus_csv="$(IFS=,; echo "${DEFOCUS_A_LIST[*]}")"
@@ -175,6 +271,7 @@ for i in "${!PREFIXES[@]}"; do
     printf '  %s: tilt_min=%s tilt_max=%s\n' \
         "${PREFIXES[$i]}" "${TILT_MIN_LIST[$i]}" "${TILT_MAX_LIST[$i]}"
 done
+
 echo "defocus_A: [$defocus_csv]"
 echo "AC:        $AC"
 echo "cube_size: $CUBE_SIZE"
@@ -196,6 +293,7 @@ isonet.py prepare_star \
     --star_name "$STAR_FILE"
 
 TILT_RANGE_FILE="tilt_ranges.tsv"
+
 for i in "${!PREFIXES[@]}"; do
     printf '%s\t%s\t%s\n' \
         "${PREFIXES[$i]}" "${TILT_MIN_LIST[$i]}" "${TILT_MAX_LIST[$i]}"
