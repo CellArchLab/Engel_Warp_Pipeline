@@ -19,11 +19,11 @@ shopt -s nullglob
 # =============================================================================
 # USER SETTINGS
 # =============================================================================
-RUN_NAME="dataset"
-DATA_FOLDER="/path/to/raw_frames_and_mdocs"
+RUN_NAME="your_dataset_name"
+DATA_FOLDER="/path/to/frames_and_mdocs"
 EXTENSION="tiff"                    # eer | tiff | tif | mrc
 ANGPIX="1.912"                      # unbinned acquisition pixel size (A/px)
-PRE_BIN="1"                         # frame-series pre-binning during import
+PRE_BIN="0"                         # frame-series pre-binning during import (1 for K3 data)
 GAIN_PATH="GainRef.gain"            # Gainref file. leave empty for no gain correction
 EXPOSURE="2.22"                     # dose per tilt (e-/A^2)
 TILT_AXIS="-84.25"                  # leave empty to use the mdoc value
@@ -32,7 +32,7 @@ GAIN_FLIP_Y="false"                 # EER true, TIFF false
 AT_BINNING="8"                      # QC/alignment reconstruction binning
 MA_BINNING="4"                      # post-MissAlignment reconstruction binning
 ALIGNZ="2200"
-MIN_INTENSITY="0.90"
+MIN_INTENSITY="0.80"
 MIN_FOV="0.00"
 USE_ETOMO="false"
 USE_ARETOMO3="true"
