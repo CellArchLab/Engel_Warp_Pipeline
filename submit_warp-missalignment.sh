@@ -389,7 +389,7 @@ cat > "$TS_DIR/submit_missalignment.sh" <<MISS
 #SBATCH --time=24:00:00
 #SBATCH --qos=emgpu
 
-set -Eeuo pipefail
+set -Eeo pipefail
 
 ml purge
 ml "${MISS_MODULE}"
@@ -428,7 +428,7 @@ cat > "submit_post_miss_${RUN_NAME}.sh" <<POST
 #SBATCH --time=08:00:00
 #SBATCH --qos=emgpu
 
-set -Eeuo pipefail
+set -Eeo pipefail
 
 backup_if_exists() {
     local target="\$1"
