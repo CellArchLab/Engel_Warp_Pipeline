@@ -3,7 +3,6 @@
 #SBATCH --partition=emgpu
 #SBATCH --qos=emgpu
 #SBATCH --gres=gpu:2
-#SBATCH --exclude=sgp[01-04]
 #SBATCH --mem=100G
 #SBATCH --time=00-08:00:00
 #SBATCH --cpus-per-task=8
