@@ -28,7 +28,7 @@ MW_WEIGHT=200
 OUTPUT_NAME="CTFnetwork_box96"
 WORK_ROOT="isonet2_work"
 
-ISONET_MODULE="IsoNet/2.0.0"
+ISONET_MODULE="IsoNet"
 
 # =============================================================================
 # END USER SETTINGS
@@ -355,6 +355,7 @@ MODEL="$NETWORK_DIR/network_isonet2-n2n_unet-medium_${CUBE_SIZE}_full.pt"
 time isonet.py predict \
     "$STAR_FILE" \
     "$MODEL" \
+    --isCTFflipped True \
     --gpuID "$GPU_IDS"
 
 echo "IsoNet2 output written to: $RUN_DIR"
