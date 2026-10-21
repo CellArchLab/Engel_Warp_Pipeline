@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Prepare and submit folder-based IsoNet2 refine/predict SLURM jobs (Python >=3.8)."""
+import argparse
+import csv
+import fnmatch
+import math
+import os
+from pathlib import Path
+import shlex
+import statistics
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+
+def files_in(folder, suffix, include=None, exclude=None):
+    p = Path(folder).expanduser().resolve()
+    if not p.is_dir():
+        raise ValueError('Not a directory: {}'.format(p))
+    result = sorted((x for x in p.iterdir() if x.is_file() and x.name.lower().endswith(suffix.lower())), key=lambda x: x.name)
+    if include:
+        result = [x for x in result if any(fnmatch.fnmatch(x.stem, pat) for pat in include)]
+    if exclude:
+        result = [x for x in result if not any(fnmatch.fnmatch(x.stem, pat) for pat in exclude)]
+    return result
+
+
+def match_count(items, n, label):
+    if len(items) != n:
+        raise ValueError('{} has {} files but expected {}. Inspect sorted pairing.'.format(label, len(items), n))
+
+
+def parse_tlt(path):
+    values = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            values.append(float(line.split()[0]))
+    if not values:
+        raise ValueError('No angles: {}'.format(path))
+    return values
+
+
+def parse_warp(path):
+    root = ET.parse(str(path)).getroot()
+    elem = root.find('Angles')
+    if elem is None or not elem.text:
+        raise ValueError('Missing <Angles>: {}'.format(path))
+    vals = [float(x) for x in elem.text.split()]
+    used = root.find('UseTilt')
+    if used is not None and used.text:
+        flags = [x.lower() == 'true' for x in used.text.split()]
+        if len(flags) != len(vals):
+            raise ValueError('UseTilt/Angles length mismatch: {}'.format(path))
+        vals = [v for v, ok in zip(vals, flags) if ok]
+    if not vals:
+        raise ValueError('No selected angles: {}'.format(path))
+    return vals
+
+
+def parse_ctf(path):
+    # AreTomo3: frame, defocus1(A), defocus2(A), astigmatism, ...
+    means = []
+    for line in path.read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            raise ValueError('Malformed CTF line in {}: {}'.format(path, line))
+        a, b = float(parts[1]), float(parts[2])
+        if math.isfinite(a) and math.isfinite(b) and a > 0 and b > 0:
+            means.append((a+b)/2)
+    if not means:
+        raise ValueError('No valid defocus values: {}'.format(path))
+    return statistics.median(means)
+
+
+def parse_warp_defocus(path):
+    """Read Warp CTF/Param[@Name='Defocus'] in micrometers; return Angstroms."""
+    root = ET.parse(str(path)).getroot()
+    values = root.findall('./CTF/Param[@Name="Defocus"]')
+    if len(values) != 1 or values[0].get('Value') is None:
+        raise ValueError('Expected exactly one CTF Defocus value in Warp XML: {}'.format(path))
+    try:
+        defocus_um = float(values[0].get('Value'))
+    except ValueError:
+        raise ValueError('Invalid Warp defocus in {}'.format(path))
+    if not math.isfinite(defocus_um) or defocus_um <= 0:
+        raise ValueError('Non-positive/non-finite Warp defocus in {}'.format(path))
+    return defocus_um * 10000.0
+
+
+def opts():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('--even-dir', required=True)
+    p.add_argument('--odd-dir', required=True)
+    p.add_argument('--bmask-dir', help='Optional MRC boundary masks, matched in sorted order')
+    angles = p.add_mutually_exclusive_group()
+    angles.add_argument('--tlt-dir', help='IMOD .tlt folder')
+    angles.add_argument('--xml-dir', help='Warp .xml folder; convert as -(angle + LevelAngleY)')
+    angles.add_argument('--aln-dir', help='AreTomo3 .aln folder')
+    p.add_argument('--ctf-dir', help='AreTomo3 _CTF.txt files for per-tomogram median defocus (takes precedence over Warp XML)')
+    p.add_argument('--defocus-xml-dir', help='Warp XML folder for defocus if tilt angles come from ALN/TLT or fallback; --xml-dir also supplies defocus automatically')
+    p.add_argument('--tilt-min', type=float, default=-60)
+    p.add_argument('--tilt-max', type=float, default=60)
+    p.add_argument('--invert-tilt-angles', action='store_true', help='Optionally invert .tlt/.aln angles; Warp XML is always inverted')
+    p.add_argument('--defocus', type=float, default=10000, help='Fallback defocus in Å when neither AreTomo CTF nor Warp XML is given')
+    p.add_argument('--ac', type=float, default=0.07)
+    p.add_argument('--voltage', type=float, default=300)
+    p.add_argument('--cs', type=float, default=2.7)
+    p.add_argument('--pixel-size', default='auto', help='Angstroms, or auto from MRC')
+    p.add_argument('--number-subtomos', default='auto')
+    p.add_argument('--include', nargs='+')
+    p.add_argument('--exclude', nargs='+')
+    p.add_argument('--save-dir', default='isonet2_output')
+    p.add_argument('--mode', choices=['train','predict','both'], default='both')
+    p.add_argument('--model-path', help='Existing trained .pt model, required for --mode predict')
+    p.add_argument('--module', default='IsoNet/2.0.1b')
+    p.add_argument('--modules', nargs='+', help='Overrides --module with ordered modules')
+    p.add_argument('--method', default='isonet2-n2n')
+    p.add_argument('--cube-size', type=int, default=80, help='Subtomogram cube size in pixels. Must be a multiple of 16 and >= 64.')
+    p.add_argument('--epochs', type=int, default=100)
+    p.add_argument('--mw-weight', type=float, default=200)
+    p.add_argument('--ctf-mode', default='network')
+    p.add_argument('--clip-first-peak-mode', type=int, default=1)
+    p.add_argument('--is-ctf-flipped', choices=['True','False'], default='True')
+    p.add_argument('--refine-args', default='', help='Additional quoted arguments for refine')
+    p.add_argument('--predict-args', default='', help='Additional quoted arguments for predict')
+    p.add_argument('--job-name', default='isonet2')
+    p.add_argument('--partition', default='emgpu')
+    p.add_argument('--qos', default='emgpu,emgpu-fast')
+    p.add_argument('--gres', default='gpu:4')
+    p.add_argument('--nodes', type=int, default=1)
+    p.add_argument('--ntasks', type=int, default=1)
+    p.add_argument('--cpus-per-task', type=int, default=16)
+    p.add_argument('--mem', default='128G')
+    p.add_argument('--time', default='00-06:00:00')
+    p.add_argument('--exclude-nodes')
+    p.add_argument('--include-nodes')
+    p.add_argument('--extra-sbatch', action='append', default=[])
+    p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--no-submit', action='store_true')
+    return p.parse_args()
+
+
+
+
+def read_standard_tilt_angles(path, source, invert=False):
+    """Return IMOD-convention tilt angles from Warp XML, AreTomo ALN or IMOD TLT."""
+    import math
+    import xml.etree.ElementTree as ET
+    path = Path(path)
+    if source == 'xml':
+        root = ET.parse(str(path)).getroot()
+        node = root.find('Angles')
+        if node is None or not node.text:
+            raise ValueError('Missing Warp Angles in {}'.format(path))
+        values = [float(x) for x in node.text.split()]
+        selection = root.find('UseTilt')
+        if selection is not None and selection.text:
+            flags = selection.text.split()
+            if len(flags) != len(values):
+                raise ValueError('Warp UseTilt/Angles length mismatch: {}'.format(path))
+            values = [v for v, flag in zip(values, flags) if flag.lower() == 'true']
+        offset = float(root.attrib.get('LevelAngleY', '0'))
+        # Warp convention to IMOD/AreTomo convention; always applied for XML.
+        values = [-(v + offset) for v in values]
+    elif source == 'aln':
+        values = []
+        for line_no, line in enumerate(path.read_text().splitlines(), 1):
+            if line.lstrip().startswith('# Local Alignment'):
+                break
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            columns = line.split()
+            if len(columns) < 10:
+                raise ValueError('Expected 10 ALN columns in {} line {}'.format(path, line_no))
+            values.append(float(columns[9]))
+    elif source == 'tlt':
+        values = []
+        for line in path.read_text().splitlines():
+            if line.strip() and not line.lstrip().startswith('#'):
+                values.append(float(line.split()[0]))
+    else:
+        raise ValueError('Unknown tilt source: {}'.format(source))
+    # Optional additional inversion is for native ALN/TLT only.
+    if invert and source != 'xml':
+        values = [-v for v in values]
+    if not values or not all(math.isfinite(v) for v in values):
+        raise ValueError('Empty/non-finite tilt angles: {}'.format(path))
+    return values
+
+
+def write_standard_tlt(source_paths, source, output_dir, invert=False):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    converted = []
+    for index, path in enumerate(source_paths, 1):
+        angles = read_standard_tilt_angles(path, source, invert)
+        dest = output_dir / ('{:04d}_{}.tlt'.format(index, path.stem))
+        dest.write_text(''.join('{:.10g}\n'.format(a) for a in angles))
+        converted.append(dest)
+    return converted
+
+def main():
+    a = opts()
+    if a.mode == 'predict' and not a.model_path:
+        raise ValueError('--mode predict requires --model-path')
+    if a.model_path and a.mode == 'predict' and not Path(a.model_path).expanduser().is_file():
+        raise ValueError('Model not found: {}'.format(a.model_path))
+    even = files_in(a.even_dir, '.mrc', a.include, a.exclude)
+    odd = files_in(a.odd_dir, '.mrc', a.include, a.exclude)
+    if not even:
+        raise ValueError('No even tomograms found')
+    n = len(even)
+    match_count(odd,n,'Odd tomograms')
+    mask = files_in(a.bmask_dir,'.mrc') if a.bmask_dir else [None]*n
+    match_count(mask,n,'Masks')
+    tilt_source = 'xml' if a.xml_dir else ('aln' if a.aln_dir else ('tlt' if a.tlt_dir else None))
+    tilt_folder = a.xml_dir or a.aln_dir or a.tlt_dir
+    tiltfiles = files_in(tilt_folder, '.' + tilt_source) if tilt_source else [None]*n
+    match_count(tiltfiles,n,'Angle metadata')
+    if a.ctf_dir:
+        ctfs = sorted((x for x in Path(a.ctf_dir).expanduser().resolve().iterdir() if x.is_file() and x.name.lower().endswith('_ctf.txt')), key=lambda x:x.name)
+    else:
+        ctfs = [None]*n
+    match_count(ctfs,n,'CTF files')
+    # Defocus precedence: explicit AreTomo CTF > Warp XML > manual fallback.
+    # --xml-dir supplies both angles and defocus unless --ctf-dir overrides.
+    defocus_xml_dir = a.defocus_xml_dir or a.xml_dir
+    if defocus_xml_dir and not a.ctf_dir:
+        defocus_xmls = files_in(defocus_xml_dir, '.xml')
+        match_count(defocus_xmls, n, 'Warp XML defocus files')
+    else:
+        defocus_xmls = [None] * n
+    if a.tilt_min >= a.tilt_max:
+        raise ValueError('tilt-min must be smaller than tilt-max')
+    base = Path(a.save_dir).expanduser().resolve()
+    base.mkdir(parents=True,exist_ok=True)
+    staging = base/'input_staging'
+    for sub in ('even','odd','mask'):
+        (staging/sub).mkdir(parents=True,exist_ok=True)
+    standardized = base/'tilt_angles'
+    if tilt_source:
+        converted = write_standard_tlt(tiltfiles, tilt_source, standardized, a.invert_tilt_angles)
+    else:
+        converted = [None]*n
+    rows=[]
+    for i,(ev,od,ma,ang,ctf,defocus_xml) in enumerate(zip(even,odd,mask,tiltfiles,ctfs,defocus_xmls)):
+        if ang:
+            vals = read_standard_tilt_angles(ang, tilt_source, a.invert_tilt_angles)
+            tmin,tmax=min(vals),max(vals)
+        else:
+            tmin,tmax=a.tilt_min,a.tilt_max
+            if a.invert_tilt_angles:
+                tmin,tmax=-tmax,-tmin
+        df = parse_ctf(ctf) if ctf else (parse_warp_defocus(defocus_xml) if defocus_xml else a.defocus)
+        if df <= 0 or not math.isfinite(df):
+            raise ValueError('Invalid defocus in row {}'.format(i+1))
+        stem='tomo_{:05d}'.format(i+1)
+        rows.append(dict(index=i+1,even=str(ev),odd=str(od),mask=str(ma) if ma else '',angles=str(converted[i]) if ang else '',ctf=str(ctf) if ctf else '',defocus_xml=str(defocus_xml) if defocus_xml else '',tilt_min=tmin,tilt_max=tmax,defocus_A=df,staged_name=stem+'.mrc'))
+    # Stage symlinks so IsoNet2's folder-sorted matching is guaranteed even if names differ.
+    for row in rows:
+        name=row['staged_name']
+        for folder,key in [('even','even'),('odd','odd'),('mask','mask')]:
+            path=staging/folder/name
+            if path.is_symlink() or path.exists():
+                path.unlink()
+            if row[key]:
+                path.symlink_to(row[key])
+    manifest=base/'input_manifest.tsv'
+    with manifest.open('w',newline='') as handle:
+        writer=csv.DictWriter(handle,fieldnames=list(rows[0]),delimiter='\t')
+        writer.writeheader();writer.writerows(rows)
+    # IsoNet2 prepare_star supports lists for defocus but scalar tilt limits.
+    # Patch rlnTiltMin, rlnTiltMax and rlnDefocus per row after prepare_star.
+    star=base/'tomograms.star'
+    modeldir=base/'refine_output'
+    patch=base/'patch_star.py'
+    patch.write_text('''#!/usr/bin/env python3
+import csv,sys
+import starfile
+manifest, starpath = sys.argv[1:3]
+with open(manifest, newline="") as fh:
+    rows=list(csv.DictReader(fh,delimiter="\\t"))
+data=starfile.read(starpath)
+if isinstance(data,dict):
+    raise RuntimeError("Unexpected multiblock STAR")
+if len(data)!=len(rows):
+    raise RuntimeError("STAR/manifest row count mismatch")
+# IsoNet sorts staged files lexically, identical to generated tomo_00001 names.
+for i,row in enumerate(rows):
+    for col,key in (("rlnDefocus","defocus_A"),("rlnTiltMin","tilt_min"),("rlnTiltMax","tilt_max")):
+        data.loc[i,col]=float(row[key])
+starfile.write(data,starpath,overwrite=True)
+print(data[["rlnDefocus","rlnTiltMin","rlnTiltMax"]].to_string(index=False))
+''')
+    Q=shlex.quote
+    lines=['#!/bin/bash -l', '#SBATCH --job-name='+a.job_name,'#SBATCH --partition='+a.partition,'#SBATCH --qos='+a.qos,'#SBATCH --gres='+a.gres,'#SBATCH --nodes='+str(a.nodes),'#SBATCH --ntasks='+str(a.ntasks),'#SBATCH --cpus-per-task='+str(a.cpus_per_task),'#SBATCH --mem='+a.mem,'#SBATCH --time='+a.time,'#SBATCH --output='+str(base/'logs/isonet2_%j.out')]
+    if a.exclude_nodes: lines.append('#SBATCH --exclude='+a.exclude_nodes)
+    if a.include_nodes: lines.append('#SBATCH --nodelist='+a.include_nodes)
+    for directive in a.extra_sbatch:
+        if not directive.startswith('#SBATCH '):
+            raise ValueError('--extra-sbatch must start with #SBATCH ')
+        lines.append(directive)
+    lines+=['','ml purge']
+    for module in (a.modules or [a.module]):
+        lines.append('ml '+Q(module))
+    lines += ['','cd '+Q(str(base)), 'export PYTHONUNBUFFERED=1', 'GPU_IDS="${CUDA_VISIBLE_DEVICES:-0}"',
+              'echo "GPU IDs: $GPU_IDS"']
+    # Creating a STAR for prediction too ensures independent use of the wrapper.
+    prep=['isonet.py','prepare_star','--even',str(staging/'even'),'--odd',str(staging/'odd'), '--star_name',str(star),'--defocus','[{}]'.format(a.defocus),'--ac',str(a.ac),'--voltage',str(a.voltage),'--cs',str(a.cs),'--tilt_min',str(a.tilt_min),'--tilt_max',str(a.tilt_max),'--number_subtomos',str(a.number_subtomos)]
+    if a.bmask_dir: prep+=['--mask_folder',str(staging/'mask')]
+    if a.pixel_size!='auto': prep+=['--pixel_size',str(a.pixel_size)]
+    lines += [' '.join(map(Q,prep)), 'python '+Q(str(patch))+' '+Q(str(manifest))+' '+Q(str(star))]
+    if a.mode in ('train','both'):
+        refine=['isonet.py','refine',str(star),'-o',str(modeldir),'--method',a.method,'--cube_size',str(a.cube_size),'--epochs',str(a.epochs),'--mw_weight',str(a.mw_weight),'--CTF_mode',a.ctf_mode,'--clip_first_peak_mode',str(a.clip_first_peak_mode),'--isCTFflipped',a.is_ctf_flipped]
+        lines.append('time '+' '.join(map(Q,refine))+' --gpuID "$GPU_IDS" '+ ' '.join(map(Q,shlex.split(a.refine_args))))
+    if a.mode in ('predict','both'):
+        if a.model_path:
+            model=Path(a.model_path).expanduser().resolve()
+            model_arg=Q(str(model))
+        else:
+            model_arg=Q(str(modeldir/('network_{}_unet-medium_{}_full.pt'.format(a.method,a.cube_size))))
+        predict=['isonet.py','predict',str(star),model_arg,'--isCTFflipped',a.is_ctf_flipped]
+        lines.append('time '+' '.join(map(Q,predict))+' --gpuID "$GPU_IDS" '+ ' '.join(map(Q,shlex.split(a.predict_args))))
+    script=base/'submit_isonet2.sh'
+    script.write_text('\n'.join(lines)+'\n')
+    script.chmod(0o755)
+    print('Paired {} tomograms; manifest: {}'.format(n,manifest))
+    for row in rows:
+        print('{:>3} {} | {} | mask={} | angle=({:.2f},{:.2f}) | defocus={:.1f} A'.format(row['index'],Path(row['even']).name,Path(row['odd']).name,Path(row['mask']).name if row['mask'] else '-',row['tilt_min'],row['tilt_max'],row['defocus_A']))
+    print('SLURM script:',script)
+    if a.dry_run:
+        print(script.read_text())
+    elif not a.no_submit:
+        subprocess.run(['sbatch',str(script)],check=True)
+    else:
+        print('Submit with: sbatch {}'.format(Q(str(script))))
+
+
+if __name__=='__main__':
+    try:
+        main()
+    except (ValueError,OSError,ET.ParseError,subprocess.CalledProcessError) as exc:
+        print('ERROR:',exc,file=sys.stderr)
+        sys.exit(2)
