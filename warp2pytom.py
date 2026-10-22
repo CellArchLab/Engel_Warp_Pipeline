@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import shlex
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -14,22 +15,32 @@ def parse_args():
         description="Create PyTom MatchPick submission from Warp tilt-series XMLs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-i", "--warp-dir", required=True, help="Warp tilt-series directory containing Position_*.xml and reconstruction/")
+    p.add_argument("-i", "--warp-dir", help="Warp tilt-series directory containing Position_*.xml and reconstruction/")
     p.add_argument("-d", "--output-dir", default="submission", help="Output directory")
     p.add_argument("--pattern", default="*.xml", help="XML glob pattern inside --warp-dir")
     p.add_argument("--bmask-dir", help="Optional tomogram-mask directory with files named <prefix>.mrc")
     p.add_argument("--mode", choices=["array", "per-tomo"], default="array")
+    p.add_argument("--workflow", choices=["match", "extract"], default="match",
+                   help="Template matching or candidate extraction SLURM array")
+    p.add_argument("-n", "--n-candidates", type=int, default=1000,
+                   help="Maximum number of extracted candidates per tomogram")
+    p.add_argument("-c", "--cutoff", type=float, default=0.1,
+                   help="Candidate extraction score cutoff")
+    p.add_argument("--relion5-compat", action="store_true", default=False,
+                   help="Enable RELION5 output (off by default for WarpTools compatibility)")
+    p.add_argument("--extract-extra-args", default="", metavar='"OPTIONS"',
+                   help="Additional shell-quoted flags for pytom_extract_candidates.py")
 
-    p.add_argument("-t", "--template", required=True)
-    p.add_argument("-m", "--mask", required=True)
-    p.add_argument("-g", "--gpu-ids", nargs="+", required=True)
-    p.add_argument("--voxel-size-angstrom", type=float, required=True)
+    p.add_argument("-t", "--template")
+    p.add_argument("-m", "--mask")
+    p.add_argument("-g", "--gpu-ids", nargs="+")
+    p.add_argument("--voxel-size-angstrom", type=float)
     p.add_argument("--dose", type=float, help="Fallback per-tilt dose if XML has no <Dose>")
     p.add_argument("--include", nargs="+")
     p.add_argument("--exclude", nargs="+")
     p.add_argument("--dry-run", action="store_true")
 
-    grp = p.add_mutually_exclusive_group(required=True)
+    grp = p.add_mutually_exclusive_group(required=False)
     grp.add_argument("--particle-diameter", type=float)
     grp.add_argument("--angular-search")
 
@@ -61,11 +72,11 @@ def parse_args():
     p.add_argument("--ntasks-per-node", default="1")
     p.add_argument("--cpus-per-task", default="4")
     p.add_argument("--gres", default="gpu:1")
-    p.add_argument("--mem", default="128")
-    p.add_argument("--qos", default="emgpu")
+    p.add_argument("--mem", default=120, type=int)
+    p.add_argument("--qos", default="emgpu,emgpu-fast")
     p.add_argument("--time", default="05:00:00")
     p.add_argument("--mail-type", default="none")
-    p.add_argument("--array-max-parallel", type=int, default=8)
+    p.add_argument("--array-max-parallel", "--max-parallel", type=int, default=20)
     p.add_argument("--exclude-nodes", nargs="+")
     p.add_argument("--include-nodes", nargs="+")
     return p.parse_args()
@@ -282,7 +293,7 @@ def make_array_sbatch(jobs, args, output_dir: Path):
 
     script = output_dir / "submit_array.sh"
     with open(script, "w") as f:
-        f.write(sbatch_header(args, output_dir, "#SBATCH -o pytom_%A_%a.out\n##SBATCH -e pytom_%A_%a.err", "pytom_tm", array_spec))
+        f.write(sbatch_header(args, output_dir, "#SBATCH -o logs/pytom_%A_%a.out", "pytom_tm", array_spec))
         f.write(f'PREFIX_LIST="{prefix_list}"\n')
         f.write(f'TOMO_LIST="{tomo_list}"\n')
         f.write(f'OUT_DIR="{output_dir}"\n')
@@ -303,7 +314,7 @@ def make_per_tomo(prefix, tomo, args, output_dir: Path):
     od = output_dir / prefix
     script = od / f"submit_{prefix}.sh"
     with open(script, "w") as f:
-        f.write(sbatch_header(args, output_dir, "#SBATCH -o pytom.out%j", f"pytom_{prefix.split('_')[-1]}"))
+        f.write(sbatch_header(args, output_dir, "#SBATCH -o logs/pytom.out%j", f"pytom_{prefix.split('_')[-1]}"))
         f.write(f'TEMPLATE="{resolved(args.template)}"\n')
         f.write(f'PMASK="{resolved(args.mask)}"\n')
         f.write(f'BMASK_DIR="{bmask_dir(args)}"\n')
@@ -312,6 +323,86 @@ def make_per_tomo(prefix, tomo, args, output_dir: Path):
         f.write(f'TOMO="{tomo}"\n')
         f.write(job_body(args))
     os.chmod(script, 0o755)
+    return script
+
+
+
+def make_extract_array_sbatch(args, output_dir: Path):
+    """Submit one existing template-matching *_job.json per array element."""
+    if not output_dir.is_dir():
+        raise FileNotFoundError(f"Matching output directory not found: {output_dir}")
+
+    def patterns(values):
+        return [p for item in (values or []) for p in item.split(",") if p]
+
+    include, exclude = patterns(args.include), patterns(args.exclude)
+    jobs = sorted(
+        (p.resolve() for p in output_dir.rglob("*_job.json") if p.is_file()),
+        key=str,
+    )
+    def selected(path):
+        names = (path.parent.name, path.name.removesuffix("_job.json"))
+        return ((not include or any(fnmatch.fnmatch(n, pattern) for n in names for pattern in include))
+                and not any(fnmatch.fnmatch(n, pattern) for n in names for pattern in exclude))
+    jobs = [p for p in jobs if selected(p)]
+    if not jobs:
+        raise RuntimeError(f"No *_job.json files found under {output_dir} after filtering")
+
+    diameter = args.particle_diameter if args.particle_diameter is not None else 300.0
+    if diameter <= 0 or args.n_candidates <= 0:
+        raise ValueError("Particle diameter and candidate count must be positive")
+    if args.array_max_parallel is not None and args.array_max_parallel <= 0:
+        raise ValueError("--array-max-parallel must be positive")
+    extras = shlex.split(args.extract_extra_args)
+    managed = {"-j", "--job", "--particle-diameter", "-n", "--n-candidates", "-c", "--cutoff", "--relion5-compat"}
+    if any(x in managed or any(x.startswith(flag + "=") for flag in managed if flag.startswith("--")) for x in extras):
+        raise ValueError("Do not override managed extraction flags using --extract-extra-args")
+
+    (output_dir / "logs").mkdir(parents=True, exist_ok=True)
+    manifest = output_dir / "extract_jobs.txt"
+    manifest.write_text("".join(f"{job}\n" for job in jobs))
+    limit = f"%{args.array_max_parallel}" if args.array_max_parallel is not None else ""
+    script = output_dir / "submit_extract_array.sh"
+    lines = [
+        "#!/bin/bash -l",
+        f"#SBATCH -D {output_dir}",
+        f"#SBATCH -o {output_dir}/logs/pytom_extract_%A_%a.out",
+        "#SBATCH -J pytom_extract",
+        f"#SBATCH --partition={args.partition}",
+        f"#SBATCH --array=0-{len(jobs)-1}{limit}",
+        f"#SBATCH --ntasks={args.ntasks}",
+        f"#SBATCH --nodes={args.nodes}",
+        f"#SBATCH --ntasks-per-node={args.ntasks_per_node}",
+        f"#SBATCH --cpus-per-task={args.cpus_per_task}",
+        "#SBATCH --gres=gpu:1",
+        f"#SBATCH --mail-type={args.mail_type}",
+        f"#SBATCH --mem={args.mem}G",
+        f"#SBATCH --qos={args.qos}",
+        f"#SBATCH --time={args.time}",
+    ]
+    if args.exclude_nodes:
+        lines.append(f'#SBATCH --exclude={",".join(args.exclude_nodes)}')
+    if args.include_nodes:
+        lines.append(f'#SBATCH --nodelist={",".join(args.include_nodes)}')
+    lines.extend([
+        "", "ml purge", "ml pytom-match-pick", "",
+        f"MANIFEST={shlex.quote(str(manifest))}",
+        'JOB=$(sed -n "$((SLURM_ARRAY_TASK_ID+1))p" "$MANIFEST")',
+        '[[ -n "$JOB" && -s "$JOB" ]] || { echo "Missing job JSON: $JOB" >&2; exit 2; }',
+        'CMD=(pytom_extract_candidates.py -j "$JOB")',
+        f'CMD+=(--particle-diameter {diameter:g})',
+        f'CMD+=(-n {args.n_candidates})',
+        f'CMD+=(-c {args.cutoff})',
+    ])
+    if args.relion5_compat:
+        lines.append('CMD+=(--relion5-compat)')
+    if extras:
+        lines.append('CMD+=(' + ' '.join(shlex.quote(item) for item in extras) + ')')
+    lines.extend(['printf "Command: "; printf "%q " "${CMD[@]}"; echo', '"${CMD[@]}"', ''])
+    script.write_text("\n".join(lines))
+    script.chmod(0o755)
+    print(f"Extraction: {len(jobs)} job JSON files, 1 GPU per array task")
+    print(f"Manifest: {manifest}\nSBATCH: {script}")
     return script
 
 
@@ -324,10 +415,25 @@ def submit(script, dry_run):
 
 def main():
     args = parse_args()
-    warp_dir = Path(args.warp_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
+    if args.workflow == "extract":
+        if args.gres != "gpu:1":
+            print("NOTE: extraction always requests gpu:1 (ignoring --gres)")
+        submit(make_extract_array_sbatch(args, output_dir), args.dry_run)
+        print("Done.")
+        return
+    else:
+        required = {"--warp-dir": args.warp_dir, "--template": args.template,
+                    "--mask": args.mask, "--gpu-ids": args.gpu_ids,
+                    "--voxel-size-angstrom": args.voxel_size_angstrom}
+        missing = [flag for flag, value in required.items() if value is None]
+        if missing or (args.particle_diameter is None and args.angular_search is None):
+            raise SystemExit("Template matching requires " + ", ".join(missing) +
+                            (" and --particle-diameter or --angular-search" if args.particle_diameter is None and args.angular_search is None else ""))
+    warp_dir = Path(args.warp_dir).resolve()
     recon = warp_dir / "reconstruction_miss"
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     xml_files = [x for x in sorted(warp_dir.glob(args.pattern)) if wanted(x.stem, args.include, args.exclude)]
     if not xml_files:

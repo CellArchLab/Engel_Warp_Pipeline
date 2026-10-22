@@ -9,7 +9,7 @@ A compact workflow connecting [Warp/M](https://github.com/warpem/warp), [Miss-Al
 | Step | Script | Description |
 |:---:|---|---|
 | 1 | `submit_warp-missalignment.sh` | Processes raw tilt-series data in Warp, performs initial IMOD or AreTomo alignment, runs Miss-Alignment, and reconstructs the final tomograms in `warp_tiltseries_<RUN_NAME>/reconstruction_miss/` |
-| 2 | `warp2pytom.py` | Generates and submits pytom-match-pick jobs from the Warp XML metadata in batch for all tomos |
+| 2 | `warp2pytom.py` | Submits PyTom template-matching jobs from Warp XML metadata, then extracts particle candidates in a separate SLURM array workflow |
 | 3 | `submit_export_particles.sh` | Merges pytom particle STAR files, normalizes their tomogram identifiers for WarpTools, exports particles, and merges the resulting metadata across datasets for [RELION5](https://github.com/3dem/relion/tree/ver5.0) |
 | 4 | `isonet2_pipeline` | Trains and applies IsoNet2 using the post-Miss-Alignment odd/even half tomograms, tilt angles, Warp XML defocus values, and user-supplied masks |
 
@@ -25,7 +25,11 @@ sbatch submit_warp-missalignment.sh
 
 ---
 
-## 2. Batch Submission of `pytom-match-pick` from Warp/M
+## 2. `warp2pytom.py` — PyTom Template Matching and Candidate Extraction
+
+The wrapper provides two workflows: `--workflow match` (default) and `--workflow extract`. Run matching first, then extract candidates from the generated `*_job.json` files.
+
+### Template matching (`--workflow match`)
 
 Check `--help` for all flag options and description especially for the SLURM header.
 This script automates batch submission of `pytom-match-pick` jobs on an HPC cluster (SLURM) by reading metadata directly from Warp tilt-series XMLs. It:
@@ -33,7 +37,7 @@ This script automates batch submission of `pytom-match-pick` jobs on an HPC clus
 - Extracts **tilt angles** from `<Angles>` in each `*.xml` (sign-flipped to the pytom convention)
 - Reads **per-tilt defocus** (μm) from the `<GridCTF>`
 - Builds **per-tilt exposure** from `<Dose>`
-- Locates the matching reconstruction in `reconstruction/`
+- Locates the matching reconstruction in `reconstruction_miss/`
 
 It runs on all tilt-series matched by `--pattern` (default `*.xml`) unless restricted with `--include` / `--exclude`.
 
@@ -46,30 +50,27 @@ It runs on all tilt-series matched by `--pattern` (default `*.xml`) unless restr
 | `array` *(default)* | Single SLURM **array job** (`submit_array.sh`) over all tomograms |
 | `per-tomo` | One standalone `submit_<prefix>.sh` per tomogram |
 
-### Usage
+### Matching example
 
 ```bash
-./warp2pytom.py \
-  -i /path/to/warp/tiltseries \                                # required: dir with *.xml and reconstruction/
-  -d submission \                                              # optional: output dir name (gets created), default "submission"
-  -t /path/to/template.mrc \                                   # required
-  -m /path/to/mask.mrc \                                       # required
-  -g 0 \                                                       # required, GPU IDs space-separated (no commas)
-  --voxel-size-angstrom 10 \                                   # required
-  --dose 2 \                                                   # optional fallback if XML has no <Dose> (e-/Å² per tilt)
-  --mode array \                                               # array (default) or per-tomo
-  [--include Position_1] [--exclude Position_5 Position_6] \   # optional wildcard filtering
-  --angular-search 10  \                                       # angular search, the lower the finer and slower is the search. Optional also --particle-diameter
-  -s 2 2 1 \                                                   # optional
-  --per-tilt-weighting \                                       # optional but highly recommended
-  --non-spherical-mask \                                       # optional
-  --tomogram-ctf-model phase-flip \                            # optional but recommended
-  -r \                                                         # optional but recommended
-  --rng-seed 69 \                                              # default: 69
-  [--dry-run]                                                  # optional
+python warp2pytom.py \
+  --workflow match \
+  -i /path/to/warp/tiltseries \
+  -d submission \
+  -t /path/to/template.mrc \
+  -m /path/to/mask.mrc \
+  -g 0 \
+  --voxel-size-angstrom 10 \
+  --angular-search 10 \
+  --mode array \
+  --per-tilt-weighting \
+  --tomogram-ctf-model phase-flip \
+  --dry-run
 ```
 
-> **Note:** one of `--particle-diameter` or `--angular-search` is **required** (mutually exclusive).
+Use `--dose 2` as a fallback when Warp XML has no `<Dose>` values. You can also pass `--bmask-dir`, `-s 2 2 1`, `--non-spherical-mask`, `-r`, `--rng-seed`, and `--include`/`--exclude` filters. The matching workflow requires `--warp-dir`, `--template`, `--mask`, `--gpu-ids`, `--voxel-size-angstrom`, and **exactly one** of `--particle-diameter` or `--angular-search`.
+
+`--mode array` creates `submission/submit_array.sh` (default); `--mode per-tomo` creates one submission script per tomogram. This setting applies only to matching; extraction always uses an array.
 
 **Defaults written automatically:**
 
@@ -79,15 +80,77 @@ It runs on all tilt-series matched by `--pattern` (default `*.xml`) unless restr
 --voltage 300
 ```
 
+### Candidate extraction (`--workflow extract`)
+
+After template matching finishes, submit particle-candidate extraction directly through the same wrapper. **No Warp XML directory, template, mask, GPU IDs, or voxel size is needed for this workflow.** The wrapper recursively discovers `*_job.json` files under `--output-dir`, sorts them lexicographically, and creates one SLURM array task per JSON.
+
+```bash
+python warp2pytom.py \
+  --workflow extract \
+  -d submission/
+```
+
+The default command for each array task is equivalent to:
+
+```bash
+pytom_extract_candidates.py \
+  -j submission/Position_1/Position_1_job.json \
+  --particle-diameter 300 \
+  -n 1000 \
+  -c 0.1
+```
+
+**`--relion5-compat` is OFF by default** for WarpTools-compatible output. Supply `--relion5-compat` only when RELION5-compatible particle output is desired.
+
+| Extraction option | Default | Purpose |
+|---|---|---|
+| `--particle-diameter` | `300` Å | Extraction particle diameter (independent of the matching search setting) |
+| `-n`, `--n-candidates` | `1000` | Maximum number of candidate particles per tomogram |
+| `-c`, `--cutoff` | `0.1` | Minimum score threshold |
+| `--relion5-compat` | off | Opt in to RELION5-compatible output; leave off for WarpTools |
+| `--extract-extra-args` | empty | Other extraction CLI flags, as a single shell-quoted string |
+| `--array-max-parallel`, `--max-parallel` | `20` | Maximum concurrent SLURM array tasks |
+
+To select subsets or customize extraction:
+
+```bash
+python warp2pytom.py \
+  --workflow extract \
+  -d submission/ \
+  --include 'Position_1*' \
+  --particle-diameter 250 \
+  -n 2000 \
+  -c 0.15 \
+  --extract-extra-args '--some-supported-option value' \
+  --dry-run
+```
+
+Use `--include`/`--exclude` to filter using a job JSON's enclosing folder name or basename (wildcards supported). Arguments managed directly by the wrapper (for example `-j`, `-n`, `-c`, and `--particle-diameter`) cannot be overridden through `--extract-extra-args`.
+
+**GPU enforcement:** each extraction task requests `#SBATCH --gres=gpu:1`, even if a different `--gres` value is supplied. Other resource settings use the standard SLURM options; defaults include partition `emgpu`, QoS `emgpu,emgpu-fast`, 120 GB memory, 4 CPUs per task, and 5 hours.
+
+**Generated extraction files:**
+
+```text
+submission/
+├── Position_1/
+│   └── Position_1_job.json
+├── Position_2/
+│   └── Position_2_job.json
+├── extract_jobs.txt
+├── submit_extract_array.sh
+└── logs/
+    ├── pytom_extract_<jobid>_0.out
+    └── pytom_extract_<jobid>_1.out
+```
+
+The log directory `submission/logs/` is also used for template-matching SLURM logs. Candidate STAR files are produced by PyTom in the individual matching output directories. `--dry-run` generates the array script and manifest without calling `sbatch`.
+
 ---
 
 ## 3. `submit_export_particles.sh` — Warp Particle Export
 
-Assuming you ran `pytom_extract_candidates.py` successfully for example like:
-```bash
-pytom_extract_candidates.py -j submission/*/*.json -n 5000 --particle-diameter 200
-```
-then you have *_particles.star files in your submission/ folder and can now proceed with running the subtomo extraction in warp using `submit_export_particles.sh`
+After completing `warp2pytom.py --workflow extract`, the `*_particles.star` files in the individual `submission/<prefix>/` folders can be used for WarpTools particle export with `submit_export_particles.sh`. Keep `--relion5-compat` disabled during candidate extraction for this WarpTools workflow.
 
 Set one entry per dataset in `DATASET_TAGS`, `PYTOM_DIRS`, and `WARP_SETTINGS`. Each pytom directory is expected to contain particle STAR files under `<PYTOM_DIR>/*/*.star`, as produced after candidate extraction from the default `warp2pytom.py` submission structure.
 
