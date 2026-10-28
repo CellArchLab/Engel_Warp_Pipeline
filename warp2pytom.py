@@ -19,6 +19,7 @@ def parse_args():
     p.add_argument("-d", "--output-dir", default="submission", help="Output directory")
     p.add_argument("--pattern", default="*.xml", help="XML glob pattern inside --warp-dir")
     p.add_argument("--bmask-dir", help="Optional tomogram-mask directory with files named <prefix>.mrc")
+    p.add_argument("--bmasks-dir", help="Optional extraction-time mask directory (<tomogram-prefix>.mrc); overrides matching mask")
     p.add_argument("--mode", choices=["array", "per-tomo"], default="array")
     p.add_argument("--workflow", choices=["match", "extract"], default="match",
                    help="Template matching or candidate extraction SLURM array")
@@ -346,19 +347,38 @@ def make_extract_array_sbatch(args, output_dir: Path):
     if not jobs:
         raise RuntimeError(f"No *_job.json files found under {output_dir} after filtering")
 
+    # Override matching-time masks only when an extraction mask directory is supplied.
+    extraction_masks = []
+    if args.bmasks_dir:
+        masks_dir = Path(args.bmasks_dir).resolve()
+        if not masks_dir.is_dir():
+            raise NotADirectoryError(f"Extraction mask directory not found: {masks_dir}")
+        for job in jobs:
+            names = [job.parent.name, job.name.removesuffix("_job.json")]
+            matches = [masks_dir / f"{name}.mrc" for name in dict.fromkeys(names)
+                       if (masks_dir / f"{name}.mrc").is_file()]
+            if len(matches) != 1:
+                raise FileNotFoundError(
+                    f"Expected exactly one extraction mask for {job}; tried {names} in {masks_dir} "
+                    f"(found {len(matches)})."
+                )
+            extraction_masks.append(matches[0])
+
     diameter = args.particle_diameter if args.particle_diameter is not None else 300.0
     if diameter <= 0 or args.n_candidates <= 0:
         raise ValueError("Particle diameter and candidate count must be positive")
     if args.array_max_parallel is not None and args.array_max_parallel <= 0:
         raise ValueError("--array-max-parallel must be positive")
     extras = shlex.split(args.extract_args)
-    managed = {"-j", "--job", "--particle-diameter", "-n", "--n-candidates", "--relion5-compat"}
+    managed = {"-j", "--job", "--particle-diameter", "-n", "--n-candidates", "--relion5-compat", "--tomogram-mask"}
     if any(x in managed or any(x.startswith(flag + "=") for flag in managed if flag.startswith("--")) for x in extras):
         raise ValueError("Do not override managed extraction flags using --extract-args")
 
     (output_dir / "logs").mkdir(parents=True, exist_ok=True)
     manifest = output_dir / "extract_jobs.txt"
     manifest.write_text("".join(f"{job}\n" for job in jobs))
+    if args.bmasks_dir:
+        (output_dir / "extract_masks.txt").write_text("".join(f"{mask}\n" for mask in extraction_masks))
     limit = f"%{args.array_max_parallel}" if args.array_max_parallel is not None else ""
     script = output_dir / "submit_extract_array.sh"
     lines = [
@@ -385,12 +405,18 @@ def make_extract_array_sbatch(args, output_dir: Path):
     lines.extend([
         "", "ml purge", "ml pytom-match-pick", "",
         f"MANIFEST={shlex.quote(str(manifest))}",
+        *( [f"MASK_MANIFEST={shlex.quote(str(output_dir / 'extract_masks.txt'))}"] if args.bmasks_dir else [] ),
         'JOB=$(sed -n "$((SLURM_ARRAY_TASK_ID+1))p" "$MANIFEST")',
         '[[ -n "$JOB" && -s "$JOB" ]] || { echo "Missing job JSON: $JOB" >&2; exit 2; }',
         'CMD=(pytom_extract_candidates.py -j "$JOB")',
+        *( ['MASK=$(sed -n "$((SLURM_ARRAY_TASK_ID+1))p" "$MASK_MANIFEST")',
+            '[[ -n "$MASK" && -f "$MASK" ]] || { echo "Missing extraction mask: $MASK" >&2; exit 2; }']
+           if args.bmasks_dir else [] ),
         f'CMD+=(--particle-diameter {diameter:g})',
         f'CMD+=(-n {args.n_candidates})',
     ])
+    if args.bmasks_dir:
+        lines.append('CMD+=(--tomogram-mask "$MASK")')
     if args.relion5_compat:
         lines.append('CMD+=(--relion5-compat)')
     if extras:
