@@ -82,22 +82,12 @@ Use `--dose 2` as a fallback when Warp XML has no `<Dose>` values. You can also 
 
 ### Candidate extraction (`--workflow extract`)
 
-After template matching finishes, submit particle-candidate extraction directly through the same wrapper. **No Warp XML directory, template, mask, GPU IDs, or voxel size is needed for this workflow.** The wrapper recursively discovers `*_job.json` files under `--output-dir`, sorts them lexicographically, and creates one SLURM array task per JSON.
+After template matching finishes, submit particle-candidate extraction directly through the same wrapper. **No Warp XML directory, template, mask, GPU IDs, or voxel size is needed for this workflow.** The wrapper recursively discovers `*_job.json` files under `--output-dir`, sorts them lexicographically, and creates one SLURM array task per JSON. Optionally, `--bmask-dir` can be supplied here, overriding any previous tomogram masks used during template matching.
 
 ```bash
 python warp2pytom.py \
   --workflow extract \
   -d submission/
-```
-
-The default command for each array task is equivalent to:
-
-```bash
-pytom_extract_candidates.py \
-  -j submission/Position_1/Position_1_job.json \
-  --particle-diameter 300 \
-  -n 1000 \
-  -c 0.1
 ```
 
 **`--relion5-compat` is OFF by default** for WarpTools-compatible output. Supply `--relion5-compat` only when RELION5-compatible particle output is desired.
