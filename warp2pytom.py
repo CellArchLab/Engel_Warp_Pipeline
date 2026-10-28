@@ -24,11 +24,9 @@ def parse_args():
                    help="Template matching or candidate extraction SLURM array")
     p.add_argument("-n", "--n-candidates", type=int, default=1000,
                    help="Maximum number of extracted candidates per tomogram")
-    p.add_argument("-c", "--cutoff", type=float, default=0.1,
-                   help="Candidate extraction score cutoff")
     p.add_argument("--relion5-compat", action="store_true", default=False,
                    help="Enable RELION5 output (off by default for WarpTools compatibility)")
-    p.add_argument("--extract-extra-args", default="", metavar='"OPTIONS"',
+    p.add_argument("--extract-args", default="", metavar='"OPTIONS"',
                    help="Additional shell-quoted flags for pytom_extract_candidates.py")
 
     p.add_argument("-t", "--template")
@@ -353,10 +351,10 @@ def make_extract_array_sbatch(args, output_dir: Path):
         raise ValueError("Particle diameter and candidate count must be positive")
     if args.array_max_parallel is not None and args.array_max_parallel <= 0:
         raise ValueError("--array-max-parallel must be positive")
-    extras = shlex.split(args.extract_extra_args)
-    managed = {"-j", "--job", "--particle-diameter", "-n", "--n-candidates", "-c", "--cutoff", "--relion5-compat"}
+    extras = shlex.split(args.extract_args)
+    managed = {"-j", "--job", "--particle-diameter", "-n", "--n-candidates", "--relion5-compat"}
     if any(x in managed or any(x.startswith(flag + "=") for flag in managed if flag.startswith("--")) for x in extras):
-        raise ValueError("Do not override managed extraction flags using --extract-extra-args")
+        raise ValueError("Do not override managed extraction flags using --extract-args")
 
     (output_dir / "logs").mkdir(parents=True, exist_ok=True)
     manifest = output_dir / "extract_jobs.txt"
@@ -392,7 +390,6 @@ def make_extract_array_sbatch(args, output_dir: Path):
         'CMD=(pytom_extract_candidates.py -j "$JOB")',
         f'CMD+=(--particle-diameter {diameter:g})',
         f'CMD+=(-n {args.n_candidates})',
-        f'CMD+=(-c {args.cutoff})',
     ])
     if args.relion5_compat:
         lines.append('CMD+=(--relion5-compat)')
